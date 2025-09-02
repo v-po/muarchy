@@ -1,0 +1,7 @@
+*~
+*.kate-swp
+*.swo
+*.swp
+*.tmp
+.project
+.settings

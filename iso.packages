@@ -1,0 +1,16 @@
+base
+base-devel
+linux
+linux-firmware
+archinstall
+python
+btrfs-progs
+snapper
+networkmanager
+iwd
+inetutils
+git
+nano
+vim
+bash-completion
+yay

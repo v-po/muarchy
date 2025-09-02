@@ -1,1 +1,309 @@
-test
+#!/bin/bash
+
+# Streamlined configurator inspired by Omarchy
+# - Bootloader: systemd-boot
+# - Filesystem: Btrfs with basic Snapper (manual rollback)
+# - DEs: We'll install via ISO/package phase; this configurator focuses on disks, locale, mirrors, etc.
+# - Passwords: handled by Archinstall (no pre-hashing here)
+# - Mirrors: use Arch defaults / reflector (no custom servers)
+# - Keeps yay in ISO for tzupdate (optional)
+
+set -euo pipefail
+
+MUARCHY_LOGO='                           ▄▄▄
+ ▄███████████▄  ▄██   ██▄   ▄███████   ▄███████   ▄███████   ▄█   █▄    ▄█   █▄
+███   ███   ███ ███   ███  ███   ███  ███   ███  ███   ███  ███   ███  ███   ███
+███   ███   ███ ███   ███  ███   ███  ███   ███  ███   █▀   ███   ███  ███   ███
+███   ███   ███ ███   ███ ▄███▄▄▄███ ▄███▄▄▄██▀  ███       ▄███▄▄▄███▄ ███▄▄▄███
+███   ███   ███ ███   ███ ▀███▀▀▀███ ▀███▀▀▀▀    ███      ▀▀███▀▀▀███  ▀▀▀▀▀▀███
+███   ███   ███ ███   ███  ███   ███ ██████████  ███   █▄   ███   ███  ▄██   ███
+███   ███   ███ ███   ███  ███   ███  ███   ███  ███   ███  ███   ███  ███   ███
+ ▀█   ███   █▀   ▀█████▀   ███   █▀   ███   ███  ███████▀   ███   █▀    ▀█████▀
+                                      ███   █▀                                  '
+
+# --- Prereqs ---------------------------------------------------------------
+if ! command -v gum >/dev/null || ! command -v iwctl >/dev/null; then
+  sudo pacman -Sy --noconfirm --needed gum iw
+fi
+
+# Keep yay for tzupdate convenience (optional)
+if command -v yay >/dev/null && ! command -v tzupdate >/dev/null; then
+  yay -Sy --noconfirm tzupdate || true
+fi
+
+abort() {
+  echo "${1:-Aborted installation}"
+  exit 1
+}
+
+working_network() {
+  sleep ${1:-3}
+  ping -c5 -W1 1.1.1.1 | grep -q "bytes from"
+}
+
+clear_logo() { clear; echo -e "$MUARCHY_LOGO\n"; echo; }
+
+step() { clear_logo; echo "$1"; echo; }
+
+notice() { clear_logo; gum spin --spinner "globe" --title "$1" -- sleep "${2:-2}"; }
+
+# STEP 1: KEYBOARD LAYOUT
+
+keyboard_form() {
+  step "Let's setup your machine..."
+  keyboards=$'English (US)|us\nEnglish (UK)|uk\nGerman|de\nFrench|fr\nSpanish|es\nSwedish|se\nItalian|it\nNorwegian|no\nDanish|dk\nFinnish|fi\nJapanese|jp\nKorean|kr\nChinese|cn'
+  choice=$(printf '%s\n' "$keyboards" | cut -d'|' -f1 | gum choose --height 10 --selected "English (US)" --header "Select keyboard layout") || abort
+  keyboard=$(printf '%s\n' "$keyboards" | awk -F'|' -v c="$choice" '$1==c{print $2; exit}')
+  loadkeys "$keyboard" 2>/dev/null || true
+}
+
+keyboard_form
+
+# STEP 2: NETWORK (OPTIONAL WHEN RUNNING OFFLINE INSTALLATION)
+
+if [[ -z $NETWORK_NOT_NEEDED ]]; then
+  step "Detecting network..."
+
+  if [[ -n $WIFI_NEEDED ]] || ! working_network; then
+    wifi_interfaces=$(iw dev | awk '$1=="Interface"{print $2}')
+    wifi_count=$(echo "$wifi_interfaces" | wc -l)
+
+    if [[ $wifi_count -eq 0 ]]; then
+      abort "No Wi-Fi interfaces found."
+    elif [[ $wifi_count -eq 1 ]]; then
+      wifi_interface="$wifi_interfaces"
+    else
+      clear_logo
+      wifi_interface=$(echo "$wifi_interfaces" | gum choose --header "Select Wi-Fi interface") || abort
+    fi
+
+    step "Scanning Wi-Fi..."
+    iw_network_scan=$(sudo iw dev "$wifi_interface" scan)
+    networks=$(echo "$iw_network_scan" | sed -n 's/^[[:space:]]*SSID: //p' | sed '/^$/d' | sort -u)
+    if [[ -n $networks ]]; then
+      while true; do
+        clear_logo
+        ssid="$(echo "$networks" | gum choose --header "Select Wi-Fi network")" || abort
+
+        step "Connecting to $ssid..."
+        if iwctl station "$wifi_interface" connect "$ssid" && working_network 5; then
+          break
+        else
+          notice "Couldn't connect to network (bad password?)" 1
+        fi
+      done
+    else
+      abort "Couldn't find any Wi-Fi networks. Try manually configuring Wi-Fi with: iwctl"
+    fi
+  fi
+fi
+
+# STEP 3: USER
+
+user_form() {
+  step "Let's set some identity basics..."
+  while true; do
+    username=$(gum input --placeholder "Alphanumeric (like johndoe)" --prompt.foreground="#845DF9" --prompt "Username> ") || abort
+    [[ "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] && break || notice "Username must be alphanumeric (no spaces)" 1
+  done
+  full_name=$(gum input --placeholder "Used for git (optional)" --prompt.foreground="#845DF9" --prompt "Full name> ") || true
+  email_address=$(gum input --placeholder "Used for git (optional)" --prompt.foreground="#845DF9" --prompt "Email address> ") || true
+  while true; do
+    hostname=$(gum input --placeholder "(or press Enter for 'arch')" --prompt.foreground="#845DF9" --prompt "Hostname> ") || true
+    [[ -z "$hostname" ]] && hostname="arch"
+    [[ "$hostname" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] && break || notice "Hostname must be alphanumeric (no spaces)" 1
+  done
+  # Timezone (tzupdate if present)
+  if command -v tzupdate >/dev/null; then
+    geo_guessed_timezone=$(tzupdate -p || true)
+    timezone=$(timedatectl list-timezones | gum choose --height 12 --selected "${geo_guessed_timezone:-Etc/UTC}" --header "Timezone") || abort
+  else
+    timezone=$(timedatectl list-timezones | gum filter --height 12 --header "Timezone") || abort
+  fi
+}
+user_form
+
+while true; do
+  echo -e "Field,Value\nUsername,$username\nFull name,${full_name:-[Skipped]}\nEmail address,${email_address:-[Skipped]}\nHostname,$hostname\nTimezone,$timezone\nKeyboard,$keyboard" | gum table -s "," -p
+  gum confirm --negative "No, change it" "Does this look right?" && break || user_form
+done
+
+# Persist identity extras for post‑install setup scripts (optional)
+echo "${full_name:-}" > user_full_name.txt
+echo "${email_address:-}" > user_email_address.txt
+
+# --- Step 4: Disk layout (Btrfs + Snapper basic) --------------------------
+get_disk_info() {
+  local device="$1"; local size model
+  size=$(lsblk -dno SIZE "$device" 2>/dev/null)
+  model=$(lsblk -dno MODEL "$device" 2>/dev/null | sed 's/^\s*//; s/\s*$//')
+  local display="$device"; [[ -n "$size" ]] && display+=" ($size)"; [[ -n "$model" ]] && display+=" - $model"; echo "$display"
+}
+
+disk_form() {
+  step "Select disk to install Arch..."
+  local disk_options=""; while IFS= read -r device; do
+    [[ -n "$device" ]] && disk_options+="$(get_disk_info "$device")\n"
+  done < <(lsblk -dpno NAME,TYPE | grep -E '/dev/(sd|hd|vd|nvme|mmcblk)' | awk '{print $1}')
+  selected_display=$(echo -e "$disk_options" | gum choose --header "Install disk") || abort
+  disk=$(echo "$selected_display" | awk '{print $1}')
+}
+
+disk_form
+
+while true; do
+  echo -e "Everything on $disk will be overwritten.\nThere is no recovery built into this step."; echo
+  gum confirm --affirmative "Yes, format disk" --negative "No, change it" "Confirm overwriting ${disk}" && break || disk_form
+done
+
+# Partition sizes
+mib=$((1024 * 1024))
+gib=$((mib * 1024))
+disk_bytes=$(lsblk -bdno SIZE "$disk")
+disk_size_in_mib=$((disk_bytes / mib * mib))
+
+# ESP: 1 GiB (adequate for sd‑boot + future UKIs); Root: rest
+boot_partition_start=$((mib))
+boot_partition_size=$((1 * gib))
+main_partition_start=$((boot_partition_size + boot_partition_start))
+gpt_backup_reserve=$((mib))
+main_partition_size=$((disk_size_in_mib - main_partition_start - gpt_backup_reserve))
+
+# Keep obj_id constants (no security risk)
+ESP_ID="ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d"
+ROOT_ID="8c2c2b92-1070-455d-b76a-56263bab24aa"
+
+# --- Archinstall configuration payloads -----------------------------------
+# NOTE: We do NOT write passwords here; Archinstall will prompt and hash with yescrypt.
+
+cat > user_configuration.json <<JSON
+{
+  "app_config": null,
+  "archinstall-language": "English",
+  "auth_config": {},
+  "audio_config": { "audio": "pipewire" },
+  "bootloader": "Systemd-boot",
+  "custom_commands": [],
+  "disk_config": {
+    "btrfs_options": {
+      "snapshot_config": { "type": "Snapper" }
+    },
+    "config_type": "default_layout",
+    "device_modifications": [
+      {
+        "device": "$disk",
+        "partitions": [
+          {
+            "btrfs": [],
+            "dev_path": null,
+            "flags": ["boot", "esp"],
+            "fs_type": "fat32",
+            "mount_options": [],
+            "mountpoint": "/boot",
+            "obj_id": "$ESP_ID",
+            "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_partition_size },
+            "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_partition_start },
+            "status": "create",
+            "type": "primary"
+          },
+          {
+            "btrfs": [
+              { "mountpoint": "/",                   "name": "@" },
+              { "mountpoint": "/home",               "name": "@home" },
+              { "mountpoint": "/var/log",            "name": "@log" },
+              { "mountpoint": "/var/cache/pacman/pkg","name": "@pkg" },
+              { "mountpoint": "/.snapshots",         "name": "@snapshots" }
+            ],
+            "dev_path": null,
+            "flags": [],
+            "fs_type": "btrfs",
+            "mount_options": ["noatime", "compress=zstd"],
+            "mountpoint": null,
+            "obj_id": "$ROOT_ID",
+            "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_partition_size },
+            "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_partition_start },
+            "status": "create",
+            "type": "primary"
+          }
+        ],
+        "wipe": true
+      }
+    ],
+    "disk_encryption": {
+      "encryption_type": "luks",
+      "lvm_volumes": [],
+      "partitions": [ "$ROOT_ID" ]
+    }
+  },
+  "hostname": "$hostname",
+  "kernels": ["linux"],
+  "network_config": { "type": "iso" },
+  "ntp": true,
+  "parallel_downloads": 8,
+  "script": null,
+  "services": ["NetworkManager", "sddm"],
+  "swap": true,
+  "timezone": "$timezone",
+  "locale_config": { "kb_layout": "$keyboard", "sys_enc": "UTF-8", "sys_lang": "en_US.UTF-8" },
+  "mirror_config": {
+    "custom_repositories": [],
+    "custom_servers": [],
+    "mirror_regions": {},
+    "optional_repositories": []
+  },
+  "packages": ["base-devel", "git"],
+  "profile_config": { "gfx_driver": null, "greeter": null, "profile": {} },
+  "version": "3.0.9"
+}
+JSON
+
+# Display summary and exit. Archinstall will still prompt for passwords during install.
+if [[ ${1:-} == "dry" ]]; then
+  echo -e "\nUser Configuration (JSON):"; cat user_configuration.json
+  echo -e "\nUser Full Name:"; cat user_full_name.txt || true
+  echo -e "\nUser Email Address:"; cat user_email_address.txt || true
+  # Clean temp files for dry run
+  rm -f user_configuration.json user_full_name.txt user_email_address.txt
+else
+  echo -e "\n\nGenerated user_configuration.json"
+  echo "Run archinstall and select 'Use configuration file' to import it."
+fi
+
+archinstall --config user_configuration.json
+if [ $? -eq 0 ]; then
+  # Assume we stored username in $username earlier
+  if [ -z "$username" ]; then
+    abort "No user detected post-install."
+  fi
+
+  arch-chroot /mnt bash -c "
+    set -e
+    mkdir -p /home/$username/.local/share
+    git clone https://github.com/myusr/muarchy.git /home/$username/.local/share/muarchy
+    chown -R $username:$username /home/$username/.local/share/muarchy
+
+    # Template service
+    cat > /etc/systemd/system/muarchy-setup@.service << 'EOF'
+[Unit]
+Description=Run Muarchy First Boot Setup
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/%i/.local/share/muarchy/boot.sh
+User=%i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable muarchy-setup@$username.service
+  "
+
+  notice "Installation complete. Rebooting in 5 seconds..." 5
+  reboot
+else
+  abort "Archinstall failed"
+fi
